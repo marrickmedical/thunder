@@ -161,7 +161,7 @@ func (s *Schema) buildDescriptor(table string, primaryKeyType PrimaryKeyType, ty
 			column = tags[0]
 		}
 		if column == "" {
-			column = makeSnake(field.Name)
+			column = field.Tag.Get("column")
 		}
 		if column == "-" {
 			continue
