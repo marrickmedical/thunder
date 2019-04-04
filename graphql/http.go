@@ -34,6 +34,10 @@ type httpResponse struct {
 }
 
 func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Connection, Host, Origin, Referer, Access-Control-Request-Method, Access-Control-Request-Headers, User-Agent, Accept, Content-Type, Authorization, Content-Length, X-Requested-With, Accept-Encoding, Accept-Language")
 	writeResponse := func(value interface{}, err error) {
 		response := httpResponse{}
 		if err != nil {
@@ -49,6 +53,10 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		http.Error(w, string(responseJSON), http.StatusOK)
+	}
+
+	if r.Method == "OPTIONS" {
+		return
 	}
 
 	if r.Method != "POST" {
@@ -84,7 +92,6 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	var wg sync.WaitGroup
 	e := Executor{}
-
 	wg.Add(1)
 	runner := reactive.NewRerunner(r.Context(), func(ctx context.Context) (interface{}, error) {
 		defer wg.Done()
