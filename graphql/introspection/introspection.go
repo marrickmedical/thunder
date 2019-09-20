@@ -376,11 +376,11 @@ func ComputeSchemaJSON(schemaBuilderSchema schemabuilder.Schema) ([]byte, error)
 		return nil, err
 	}
 
-	if err := graphql.PrepareQuery(schema.Query, query.SelectionSet); err != nil {
+	if err := graphql.PrepareQuery(context.Background(), schema.Query, query.SelectionSet); err != nil {
 		return nil, err
 	}
 
-	executor := graphql.Executor{}
+	executor := graphql.NewExecutor(graphql.NewImmediateGoroutineScheduler())
 	value, err := executor.Execute(context.Background(), schema.Query, nil, query)
 	if err != nil {
 		return nil, err

@@ -12,15 +12,20 @@ import (
 // that object to build a GraphQL Field that can be resolved in the GraphQL
 // graph.
 func (sb *schemaBuilder) buildFunction(typ reflect.Type, m *method) (*graphql.Field, error) {
+	field, _, err := sb.buildFunctionAndFuncCtx(typ, m)
+	return field, err
+}
+
+func (sb *schemaBuilder) buildFunctionAndFuncCtx(typ reflect.Type, m *method) (*graphql.Field, *funcContext, error) {
 	funcCtx := &funcContext{typ: typ}
 
 	if typ.Kind() == reflect.Ptr {
-		return nil, fmt.Errorf("source-type of buildFunction cannot be a pointer (got: %v)", typ)
+		return nil, nil, fmt.Errorf("source-type of buildFunction cannot be a pointer (got: %v)", typ)
 	}
 
 	callableFunc, err := funcCtx.getFuncVal(m)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	in := funcCtx.getFuncInputTypes()
@@ -28,7 +33,7 @@ func (sb *schemaBuilder) buildFunction(typ reflect.Type, m *method) (*graphql.Fi
 
 	argParser, argType, in, err := funcCtx.getArgParserAndTyp(sb, in)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	funcCtx.hasArgs = argParser != nil
 
@@ -36,30 +41,30 @@ func (sb *schemaBuilder) buildFunction(typ reflect.Type, m *method) (*graphql.Fi
 
 	// We have succeeded if no arguments remain.
 	if len(in) != 0 {
-		return nil, fmt.Errorf("%s arguments should be [context][, [*]%s][, args][, selectionSet]", funcCtx.funcType, typ)
+		return nil, nil, fmt.Errorf("%s arguments should be [context][, [*]%s][, args][, selectionSet]", funcCtx.funcType, typ)
 	}
 
 	// Parse return values. The first return value must be the actual value, and
 	// the second value can optionally be an error.
 	err = funcCtx.parseReturnSignature(m)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	retType, err := funcCtx.getReturnType(sb, m)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	args, err := funcCtx.argsTypeMap(argType)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	return &graphql.Field{
 		Resolve: func(ctx context.Context, source, funcRawArgs interface{}, selectionSet *graphql.SelectionSet) (interface{}, error) {
 			// Set up function arguments.
-			funcInputArgs := funcCtx.prepareResolveArgs(source, funcRawArgs, ctx)
+			funcInputArgs := funcCtx.prepareResolveArgs(source, funcCtx.hasArgs, funcRawArgs, ctx, selectionSet)
 
 			// Call the function.
 			funcOutputArgs := callableFunc.Call(funcInputArgs)
@@ -70,8 +75,9 @@ func (sb *schemaBuilder) buildFunction(typ reflect.Type, m *method) (*graphql.Fi
 		Args:           args,
 		Type:           retType,
 		ParseArguments: argParser.Parse,
-		Expensive:      funcCtx.hasContext,
-	}, nil
+		Expensive:      m.Expensive,
+		External:       true,
+	}, funcCtx, nil
 }
 
 // funcContext is used to parse the function signature in buildFunction.
@@ -83,10 +89,9 @@ type funcContext struct {
 	hasRet          bool
 	hasError        bool
 
-	funcType     reflect.Type
-	isPtrFunc    bool
-	typ          reflect.Type
-	selectionSet *graphql.SelectionSet
+	funcType  reflect.Type
+	isPtrFunc bool
+	typ       reflect.Type
 }
 
 // getFuncVal returns a reflect.Value of an executable function.
@@ -238,7 +243,7 @@ func (funcCtx *funcContext) argsTypeMap(argType graphql.Type) (map[string]graphq
 
 // prepareResolveArgs converts the provided source, args and context into the
 // required list of reflect.Value types that the function needs to be called.
-func (funcCtx *funcContext) prepareResolveArgs(source interface{}, args interface{}, ctx context.Context) []reflect.Value {
+func (funcCtx *funcContext) prepareResolveArgs(source interface{}, hasArgs bool, args interface{}, ctx context.Context, selectionSet *graphql.SelectionSet) []reflect.Value {
 	in := make([]reflect.Value, 0, funcCtx.funcType.NumIn())
 	if funcCtx.hasContext {
 		in = append(in, reflect.ValueOf(ctx))
@@ -261,11 +266,11 @@ func (funcCtx *funcContext) prepareResolveArgs(source interface{}, args interfac
 	}
 
 	// Set up other arguments.
-	if funcCtx.hasArgs {
+	if hasArgs {
 		in = append(in, reflect.ValueOf(args))
 	}
 	if funcCtx.hasSelectionSet {
-		in = append(in, reflect.ValueOf(funcCtx.selectionSet))
+		in = append(in, reflect.ValueOf(selectionSet))
 	}
 
 	return in

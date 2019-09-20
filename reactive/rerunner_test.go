@@ -52,7 +52,7 @@ func TestRerun(t *testing.T) {
 		AddDependency(ctx, dep, nil)
 		run.Trigger()
 		return nil, nil
-	}, 0)
+	}, 0, false)
 
 	for i := 0; i < 10; i++ {
 		run.Expect(t, "expected (re-)run")
@@ -81,7 +81,7 @@ func TestCache(t *testing.T) {
 
 		run.Trigger()
 		return nil, nil
-	}, 0)
+	}, 0, false)
 
 	run.Expect(t, "expected run")
 	innerRun.Expect(t, "expected inner run")
@@ -91,6 +91,32 @@ func TestCache(t *testing.T) {
 
 	run.Expect(t, "expected rerun")
 	// inner run is expected cache; if it runs, it will panic in calling Trigger
+}
+
+// TestCachePurge tests that a cached computation is rerun when the cache is purged
+func TestCachePurge(t *testing.T) {
+	dep := NewResource()
+
+	run := NewExpect()
+
+	NewRerunner(context.Background(), func(ctx context.Context) (interface{}, error) {
+		AddDependency(ctx, dep, nil)
+
+		Cache(ctx, 0, func(ctx context.Context) (interface{}, error) {
+			run.Trigger()
+			return nil, nil
+		})
+
+		PurgeCache(ctx)
+		return nil, nil
+	}, 0, false)
+
+	run.Expect(t, "expected run")
+
+	run = NewExpect()
+	dep.Strobe()
+
+	run.Expect(t, "expected rerun")
 }
 
 // TestRerunCache tests that a cached computation is rerun after it is invalidated.
@@ -106,7 +132,7 @@ func TestRerunCache(t *testing.T) {
 			return nil, nil
 		})
 		return nil, nil
-	}, 0)
+	}, 0, false)
 
 	run.Expect(t, "expected run")
 
@@ -126,7 +152,7 @@ func TestStop(t *testing.T) {
 		AddDependency(ctx, dep, nil)
 		run.Trigger()
 		return nil, nil
-	}, 0)
+	}, 0, false)
 
 	run.Expect(t, "expected run")
 
@@ -145,7 +171,7 @@ func TestError(t *testing.T) {
 		AddDependency(ctx, dep, nil)
 		run.Trigger()
 		return nil, errors.New("error")
-	}, 0)
+	}, 0, false)
 
 	run.Expect(t, "expected run")
 
@@ -179,7 +205,7 @@ func TestErrorRetry(t *testing.T) {
 			run.Trigger()
 		}
 		return nil, nil
-	}, 0)
+	}, 0, false)
 
 	run.Expect(t, "expected run")
 	if innerRuns != 1 {
@@ -207,8 +233,8 @@ func TestErrorRetry(t *testing.T) {
 
 	shouldSentinel = false
 	run.Expect(t, "expected rerun after sentinel")
-	if innerRuns != 1 {
-		t.Errorf("expected 1 run, but got %d", innerRuns)
+	if innerRuns != 2 {
+		t.Errorf("expected 2 runs (first run, then retry run), but got %d", innerRuns)
 	}
 }
 
@@ -230,7 +256,7 @@ func TestErrorRetryDelay(t *testing.T) {
 		oldRun.Trigger()
 
 		return nil, RetrySentinelError
-	}, 100*time.Millisecond)
+	}, 100*time.Millisecond, false)
 
 	run.Expect(t, "expected first run")
 
@@ -273,7 +299,7 @@ func TestCacheLock(t *testing.T) {
 
 		run.Trigger()
 		return nil, nil
-	}, 0)
+	}, 0, false)
 
 	run.Expect(t, "expected run")
 }
@@ -317,7 +343,7 @@ func TestCacheParallel(t *testing.T) {
 
 		run.Trigger()
 		return nil, nil
-	}, 0)
+	}, 0, false)
 
 	run.Expect(t, "expected run")
 }
@@ -343,7 +369,7 @@ func TestMinRerunInterval(t *testing.T) {
 		}
 
 		return nil, nil
-	}, 1*time.Second)
+	}, 1*time.Second, false)
 
 	run.Expect(t, "expected run")
 
@@ -374,7 +400,7 @@ func TestRerunImmediately(t *testing.T) {
 		}
 
 		return nil, nil
-	}, 30*time.Second)
+	}, 30*time.Second, false)
 
 	run.Expect(t, "expected run")
 

@@ -33,12 +33,12 @@ func newLocker() *locker {
 // lock is a single mutex in a locker
 type lock struct {
 	ref int
-	mu  sync.Mutex
+	mu  ctxMutex
 }
 
 // Lock locks a locker by (optionally) allocating, increasing the ref count,
 // and locking
-func (l *locker) Lock(k interface{}) {
+func (l *locker) Lock(ctx context.Context, k interface{}) error {
 	l.mu.Lock()
 	m, ok := l.m[k]
 	if !ok {
@@ -47,7 +47,7 @@ func (l *locker) Lock(k interface{}) {
 	}
 	m.ref++
 	l.mu.Unlock()
-	m.mu.Lock()
+	return m.mu.Lock(ctx)
 }
 
 // Unlock unlocks a locker by unlocking, decreasing the ref count, and
@@ -101,6 +101,28 @@ func (c *cache) cleanInvalidated() {
 			delete(c.computations, key)
 		}
 	}
+}
+
+// PurgeCache is meant to be use as a transition off of using the reactive cache.
+// It allows slowly removing caching whenever the user wants, ideally between
+// cache execution runs.
+func PurgeCache(ctx context.Context) {
+	cVal := ctx.Value(cacheKey{})
+	if cVal == nil {
+		return
+	}
+	c, ok := cVal.(*cache)
+	if !ok {
+		return
+	}
+	c.purgeCache()
+}
+
+func (c *cache) purgeCache() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.computations = make(map[interface{}]*computation)
 }
 
 // Resource represents a leaf-level dependency in a computation
@@ -227,7 +249,9 @@ func Cache(ctx context.Context, key interface{}, f ComputeFunc) (interface{}, er
 	cache := ctx.Value(cacheKey{}).(*cache)
 	computation := ctx.Value(computationKey{}).(*computation)
 
-	cache.locker.Lock(key)
+	if err := cache.locker.Lock(ctx, key); err != nil {
+		return nil, err
+	}
 	defer cache.locker.Unlock(key)
 
 	if child := cache.get(key); child != nil {
@@ -255,10 +279,11 @@ type Rerunner struct {
 	ctx       context.Context
 	cancelCtx context.CancelFunc
 
-	f                ComputeFunc
-	cache            *cache
-	minRerunInterval time.Duration
-	retryDelay       time.Duration
+	f                    ComputeFunc
+	cache                *cache
+	minRerunInterval     time.Duration
+	retryDelay           time.Duration
+	alwaysSpawnGoroutine bool
 
 	// flushed tracks if the next computation should run without delay. It is set
 	// to false as soon as the next computation starts. flushCh is closed when
@@ -275,7 +300,7 @@ type Rerunner struct {
 }
 
 // NewRerunner runs f continuously
-func NewRerunner(ctx context.Context, f ComputeFunc, minRerunInterval time.Duration) *Rerunner {
+func NewRerunner(ctx context.Context, f ComputeFunc, minRerunInterval time.Duration, alwaysSpawnGoroutine bool) *Rerunner {
 	ctx, cancelCtx := context.WithCancel(ctx)
 
 	r := &Rerunner{
@@ -287,8 +312,9 @@ func NewRerunner(ctx context.Context, f ComputeFunc, minRerunInterval time.Durat
 			computations: make(map[interface{}]*computation),
 			locker:       newLocker(),
 		},
-		minRerunInterval: minRerunInterval,
-		retryDelay:       minRerunInterval,
+		minRerunInterval:     minRerunInterval,
+		retryDelay:           minRerunInterval,
+		alwaysSpawnGoroutine: alwaysSpawnGoroutine,
 
 		flushCh: make(chan struct{}, 0),
 	}
@@ -343,25 +369,33 @@ func (r *Rerunner) run() {
 		time.Sleep(WriteThenReadDelay)
 	}
 	r.cache.cleanInvalidated()
-	ctx := context.WithValue(r.ctx, cacheKey{}, r.cache)
+
+	// Cancel the context passed to "run". Canceling the context ensures that
+	// libraries let go of the context when they might otherwise hold onto it long
+	// past this run.
+	ctx, cancel := context.WithCancel(r.ctx)
+	defer cancel()
+	ctx = context.WithValue(ctx, cacheKey{}, r.cache)
 	ctx = context.WithValue(ctx, dependencySetKey{}, &dependencySet{})
 
-	computation, err := run(ctx, r.f)
+	currentComputation, err := run(ctx, r.f)
 	r.lastRun = time.Now()
 	if err != nil {
-		if err == RetrySentinelError {
-			r.retryDelay = r.retryDelay * 2
-
-			// Max out the retry delay to at 1 minute.
-			if r.retryDelay > time.Minute {
-				r.retryDelay = time.Minute
-			}
-			go r.run()
-		} else {
+		if err != RetrySentinelError {
 			// If we encountered an error that is not the retry sentinel,
 			// we should stop the rerunner.
 			return
 		}
+		// Reset the cache for sentinel errors so we get a clean slate.
+		r.cache.purgeCache()
+
+		r.retryDelay = r.retryDelay * 2
+
+		// Max out the retry delay to at 1 minute.
+		if r.retryDelay > time.Minute {
+			r.retryDelay = time.Minute
+		}
+		go r.run()
 	} else {
 		// If we succeeded in the computation, we can release the old computation
 		// and reset the retry delay.
@@ -370,12 +404,18 @@ func (r *Rerunner) run() {
 			r.computation = nil
 		}
 
-		r.computation = computation
+		r.computation = currentComputation
 		r.retryDelay = r.minRerunInterval
 
 		// Schedule a rerun whenever our node becomes invalidated (which might already
 		// have happened!)
-		computation.node.handleInvalidate(r.run)
+		currentComputation.node.handleInvalidate(func() {
+			if r.alwaysSpawnGoroutine {
+				go r.run()
+			} else {
+				r.run()
+			}
+		})
 	}
 }
 

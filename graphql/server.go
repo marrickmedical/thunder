@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
 	"net/http"
 	"sync"
@@ -30,6 +29,7 @@ type JSONSocket interface {
 
 type MakeCtxFunc func(context.Context) context.Context
 
+type AlwaysSpawnGoroutineFunc func(context.Context, *Query) bool
 type RerunIntervalFunc func(context.Context, *Query) time.Duration
 
 type GraphqlLogger interface {
@@ -59,6 +59,8 @@ type conn struct {
 	makeCtx        MakeCtxFunc
 	middlewares    []MiddlewareFunc
 
+	executor ExecutorRunner
+
 	logger             GraphqlLogger
 	subscriptionLogger SubscriptionLogger
 
@@ -69,8 +71,9 @@ type conn struct {
 	mu            sync.Mutex
 	subscriptions map[string]*reactive.Rerunner
 
-	minRerunIntervalFunc RerunIntervalFunc
-	maxSubscriptions     int
+	alwaysSpawnGoroutineFunc AlwaysSpawnGoroutineFunc
+	minRerunIntervalFunc     RerunIntervalFunc
+	maxSubscriptions         int
 }
 
 type inEnvelope struct {
@@ -95,53 +98,6 @@ type subscribeMessage struct {
 type mutateMessage struct {
 	Query     string                 `json:"query"`
 	Variables map[string]interface{} `json:"variables"`
-}
-
-type SanitizedError interface {
-	error
-	SanitizedError() string
-}
-
-type SafeError struct {
-	message string
-}
-
-type ClientError SafeError
-
-func (e ClientError) Error() string {
-	return e.message
-}
-
-func (e ClientError) SanitizedError() string {
-	return e.message
-}
-
-func (e SafeError) Error() string {
-	return e.message
-}
-
-func (e SafeError) SanitizedError() string {
-	return e.message
-}
-
-func NewClientError(format string, a ...interface{}) error {
-	return ClientError{message: fmt.Sprintf(format, a...)}
-}
-
-func NewSafeError(format string, a ...interface{}) error {
-	return SafeError{message: fmt.Sprintf(format, a...)}
-}
-
-func sanitizeError(err error) string {
-	if sanitized, ok := err.(SanitizedError); ok {
-		return sanitized.SanitizedError()
-	}
-	return "Internal server error"
-}
-
-func isCloseError(err error) bool {
-	_, ok := err.(*websocket.CloseError)
-	return ok || err == websocket.ErrCloseSent
 }
 
 func (c *conn) writeOrClose(out outEnvelope) {
@@ -193,14 +149,14 @@ func (c *conn) handleSubscribe(in *inEnvelope) error {
 		c.logger.Error(c.ctx, err, tags)
 		return err
 	}
-	if err := PrepareQuery(c.schema.Query, query.SelectionSet); err != nil {
+	if err := PrepareQuery(context.Background(), c.schema.Query, query.SelectionSet); err != nil {
 		c.logger.Error(c.ctx, err, tags)
 		return err
 	}
 
 	var previous interface{}
 
-	e := Executor{}
+	e := c.executor
 
 	initial := true
 	c.subscriptionLogger.Subscribe(c.ctx, id, tags)
@@ -294,7 +250,7 @@ func (c *conn) handleSubscribe(in *inEnvelope) error {
 
 		initial = false
 		return nil, nil
-	}, c.minRerunIntervalFunc(c.ctx, query))
+	}, c.minRerunIntervalFunc(c.ctx, query), c.alwaysSpawnGoroutineFunc(c.ctx, query))
 
 	return nil
 }
@@ -321,13 +277,13 @@ func (c *conn) handleMutate(in *inEnvelope) error {
 		c.logger.Error(c.ctx, err, tags)
 		return err
 	}
-	if err := PrepareQuery(c.mutationSchema.Mutation, query.SelectionSet); err != nil {
+	if err := PrepareQuery(c.ctx, c.mutationSchema.Mutation, query.SelectionSet); err != nil {
 		c.logger.Error(c.ctx, err, tags)
 		return err
 	}
 
 	initial := true
-	e := Executor{}
+	e := NewExecutor(NewImmediateGoroutineScheduler())
 	c.subscriptions[id] = reactive.NewRerunner(c.ctx, func(ctx context.Context) (interface{}, error) {
 		// Serialize all mutates for a given connection.
 		c.mutateMu.Lock()
@@ -394,7 +350,7 @@ func (c *conn) handleMutate(in *inEnvelope) error {
 
 		initial = false
 		return nil, errors.New("stop")
-	}, c.minRerunIntervalFunc(c.ctx, query))
+	}, c.minRerunIntervalFunc(c.ctx, query), c.alwaysSpawnGoroutineFunc(c.ctx, query))
 
 	return nil
 }
@@ -540,20 +496,28 @@ func CreateConnection(ctx context.Context, socket JSONSocket, schema *Schema, op
 		ctx:                ctx,
 		schema:             schema,
 		mutationSchema:     schema,
+		executor:           NewExecutor(NewImmediateGoroutineScheduler()),
 		subscriptions:      make(map[string]*reactive.Rerunner),
 		subscriptionLogger: &nopSubscriptionLogger{},
 		logger:             &nopGraphqlLogger{},
 		makeCtx: func(ctx context.Context) context.Context {
 			return ctx
 		},
-		maxSubscriptions:     DefaultMaxSubscriptions,
-		minRerunIntervalFunc: func(context.Context, *Query) time.Duration { return DefaultMinRerunInterval },
+		maxSubscriptions:         DefaultMaxSubscriptions,
+		minRerunIntervalFunc:     func(context.Context, *Query) time.Duration { return DefaultMinRerunInterval },
+		alwaysSpawnGoroutineFunc: func(context.Context, *Query) bool { return false },
 	}
 	for _, opt := range opts {
 		opt(c)
 	}
 
 	return c
+}
+
+func WithExecutor(executor ExecutorRunner) ConnectionOption {
+	return func(c *conn) {
+		c.executor = executor
+	}
 }
 
 func WithExecutionLogger(logger GraphqlLogger) ConnectionOption {
@@ -565,6 +529,12 @@ func WithExecutionLogger(logger GraphqlLogger) ConnectionOption {
 func WithMinRerunInterval(d time.Duration) ConnectionOption {
 	return func(c *conn) {
 		c.minRerunIntervalFunc = func(context.Context, *Query) time.Duration { return d }
+	}
+}
+
+func WithAlwaysSpawnGoroutineFunc(fn AlwaysSpawnGoroutineFunc) ConnectionOption {
+	return func(c *conn) {
+		c.alwaysSpawnGoroutineFunc = fn
 	}
 }
 

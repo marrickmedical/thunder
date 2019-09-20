@@ -12,15 +12,21 @@ import (
 )
 
 func HTTPHandler(schema *Schema, middlewares ...MiddlewareFunc) http.Handler {
+	return HTTPHandlerWithExecutor(schema, (NewExecutor(NewImmediateGoroutineScheduler())), middlewares...)
+}
+
+func HTTPHandlerWithExecutor(schema *Schema, executor ExecutorRunner, middlewares ...MiddlewareFunc) http.Handler {
 	return &httpHandler{
 		schema:      schema,
 		middlewares: middlewares,
+		executor:    executor,
 	}
 }
 
 type httpHandler struct {
 	schema      *Schema
 	middlewares []MiddlewareFunc
+	executor    ExecutorRunner
 }
 
 type httpPostBody struct {
@@ -51,8 +57,10 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-
-		http.Error(w, string(responseJSON), http.StatusOK)
+		if w.Header().Get("Content-Type") == "" {
+			w.Header().Set("Content-Type", "application/json")
+		}
+		w.Write(responseJSON)
 	}
 
 	if r.Method == "OPTIONS" {
@@ -85,13 +93,14 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if query.Kind == "mutation" {
 		schema = h.schema.Mutation
 	}
-	if err := PrepareQuery(schema, query.SelectionSet); err != nil {
+	if err := PrepareQuery(r.Context(), schema, query.SelectionSet); err != nil {
 		writeResponse(nil, err)
 		return
 	}
 
 	var wg sync.WaitGroup
-	e := Executor{}
+	e := h.executor
+
 	wg.Add(1)
 	runner := reactive.NewRerunner(r.Context(), func(ctx context.Context) (interface{}, error) {
 		defer wg.Done()

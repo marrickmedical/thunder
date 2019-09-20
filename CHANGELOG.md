@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+### Added
+
+#### `graphql`
+
+- Introduced new executor for running GraphQL queries.  Includes WorkScheduler interface to control how work is scheduled/executed.
+- Introduced BatchFieldFuncWithFallback method for the new GraphQL executor (must have fallback until we've deleted the old executor)
+
+### Changed
+
+#### `graphql`
+
+- `*SelectionSet` is now properly passed into FieldFuncs.
+- `Union` type `__typename` attributes are now the typename of the subtype (not the union type).
+- Fixed race condition in pagination FieldFuncs.
+
+#### `reactive`
+
+- Always invalidate entire reactive cache when query fails.
+
+#### `sqlgen`
+- Implemented a basic `(*sqlgen.DB).Count` receiver that wraps `SELECT COUNT(*)` functionality in SQL databases. ([#230](https://github.com/samsarahq/thunder/pull/230))
+
+
 ## [0.5.0] 2019-01-10
 
 ### Changed

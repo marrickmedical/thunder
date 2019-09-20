@@ -49,7 +49,7 @@ func (e *Enum) enumValues() []string {
 type Object struct {
 	Name        string
 	Description string
-	Key         Resolver
+	KeyField    *Field
 	Fields      map[string]*Field
 }
 
@@ -117,16 +117,23 @@ var _ Type = &Union{}
 // A Resolver calculates the value of a field of an object
 type Resolver func(ctx context.Context, source, args interface{}, selectionSet *SelectionSet) (interface{}, error)
 
+// A BatchResolver calculates the value of a field for a slice of objects.
+type BatchResolver func(ctx context.Context, sources []interface{}, args interface{}, selectionSet *SelectionSet) ([]interface{}, error)
+
 // Field knows how to compute field values of an Object
 //
 // Fields are responsible for computing their value themselves.
 type Field struct {
 	Resolve        Resolver
+	BatchResolver  BatchResolver
 	Type           Type
 	Args           map[string]Type
 	ParseArguments func(json interface{}) (interface{}, error)
 
-	Expensive bool
+	UseBatchFunc func(context.Context) bool
+	Batch        bool
+	External     bool
+	Expensive    bool
 }
 
 type Schema struct {
