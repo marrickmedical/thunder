@@ -12,6 +12,7 @@ import (
 	"github.com/samsarahq/thunder/graphql"
 	"github.com/samsarahq/thunder/graphql/schemabuilder"
 	"github.com/samsarahq/thunder/internal"
+	"github.com/samsarahq/thunder/internal/testgraphql"
 	"github.com/samsarahq/thunder/reactive"
 	"github.com/stretchr/testify/assert"
 )
@@ -37,7 +38,7 @@ func TestPathError(t *testing.T) {
 	inner := schema.Object("inner", Inner{})
 	inner.FieldFunc("expensive", func(ctx context.Context) Expensive {
 		return Expensive{}
-	})
+	}, schemabuilder.Expensive)
 	inner.FieldFunc("inners", func(ctx context.Context) []Inner {
 		return []Inner{Inner{}}
 	})
@@ -58,11 +59,11 @@ func TestPathError(t *testing.T) {
 			inner { inners { expensive { expensives { err } } } }
         }`, nil)
 
-	if err := graphql.PrepareQuery(builtSchema.Query, q.SelectionSet); err != nil {
+	if err := graphql.PrepareQuery(context.Background(), builtSchema.Query, q.SelectionSet); err != nil {
 		t.Error(err)
 	}
 
-	e := graphql.Executor{}
+	e := testgraphql.NewExecutorWrapper(t)
 	_, err := e.Execute(context.Background(), builtSchema.Query, nil, q)
 	if err == nil || err.Error() != "inner.inners.0.expensive.expensives.0.err: no good, bad" {
 		t.Errorf("bad error: %v", err)
@@ -73,11 +74,11 @@ func TestPathError(t *testing.T) {
 			safe
 		}`, nil)
 
-	if err := graphql.PrepareQuery(builtSchema.Query, q.SelectionSet); err != nil {
+	if err := graphql.PrepareQuery(context.Background(), builtSchema.Query, q.SelectionSet); err != nil {
 		t.Error(err)
 	}
 
-	e = graphql.Executor{}
+	e = testgraphql.NewExecutorWrapper(t)
 	_, err = e.Execute(context.Background(), builtSchema.Query, nil, q)
 	if err == nil || err.Error() != "safe safe" {
 		t.Errorf("bad error: %v", err)
@@ -141,39 +142,39 @@ func TestEnum(t *testing.T) {
 			inner(enumField: firstField)
 		}
 		`, nil)
-	if err := graphql.PrepareQuery(builtSchema.Query, q.SelectionSet); err != nil {
+	if err := graphql.PrepareQuery(context.Background(), builtSchema.Query, q.SelectionSet); err != nil {
 		t.Error(err)
 	}
 
-	e := graphql.Executor{}
+	e := testgraphql.NewExecutorWrapper(t)
 	val, err := e.Execute(context.Background(), builtSchema.Query, nil, q)
 	assert.Nil(t, err)
 	assert.Equal(t, map[string]interface{}{
 		"inner": "firstField",
-	}, val)
+	}, internal.AsJSON(val))
 
 	q = graphql.MustParse(`
 		{
 			inner2(enumField2: this)
 		}
 		`, nil)
-	if err := graphql.PrepareQuery(builtSchema.Query, q.SelectionSet); err != nil {
+	if err := graphql.PrepareQuery(context.Background(), builtSchema.Query, q.SelectionSet); err != nil {
 		t.Error(err)
 	}
 
-	e = graphql.Executor{}
+	e = testgraphql.NewExecutorWrapper(t)
 	val, err = e.Execute(context.Background(), builtSchema.Query, nil, q)
 	assert.Nil(t, err)
 	assert.Equal(t, map[string]interface{}{
 		"inner2": "this",
-	}, val)
+	}, internal.AsJSON(val))
 
 	q = graphql.MustParse(`
 		{
 			inner(enumField: wrongField)
 		}
 		`, nil)
-	if err := graphql.PrepareQuery(builtSchema.Query, q.SelectionSet); err == nil {
+	if err := graphql.PrepareQuery(context.Background(), builtSchema.Query, q.SelectionSet); err == nil {
 		t.Error(err)
 	}
 
@@ -182,32 +183,32 @@ func TestEnum(t *testing.T) {
 			optional(enumField: firstField)
 		}
 		`, nil)
-	if err := graphql.PrepareQuery(builtSchema.Query, q.SelectionSet); err != nil {
+	if err := graphql.PrepareQuery(context.Background(), builtSchema.Query, q.SelectionSet); err != nil {
 		t.Error(err)
 	}
 
-	e = graphql.Executor{}
+	e = testgraphql.NewExecutorWrapper(t)
 	val, err = e.Execute(context.Background(), builtSchema.Query, nil, q)
 	assert.Nil(t, err)
 	assert.Equal(t, map[string]interface{}{
 		"optional": "firstField",
-	}, val)
+	}, internal.AsJSON(val))
 
 	q = graphql.MustParse(`
 		{
 			pointerret(enumField: firstField)
 		}
 		`, nil)
-	if err := graphql.PrepareQuery(builtSchema.Query, q.SelectionSet); err != nil {
+	if err := graphql.PrepareQuery(context.Background(), builtSchema.Query, q.SelectionSet); err != nil {
 		t.Error(err)
 	}
 
-	e = graphql.Executor{}
+	e = testgraphql.NewExecutorWrapper(t)
 	val, err = e.Execute(context.Background(), builtSchema.Query, nil, q)
 	assert.Nil(t, err)
 	assert.Equal(t, map[string]interface{}{
-		"pointerret": enumType(1),
-	}, val)
+		"pointerret": float64(1),
+	}, internal.AsJSON(val))
 
 }
 
@@ -233,7 +234,7 @@ func TestEndToEndAwaitAndCache(t *testing.T) {
 	query := schema.Query()
 	query.FieldFunc("users", func(ctx context.Context) []*User {
 		return users
-	})
+	}, schemabuilder.Expensive)
 
 	_ = schema.Mutation()
 
@@ -242,7 +243,7 @@ func TestEndToEndAwaitAndCache(t *testing.T) {
 		reactive.AddDependency(ctx, u.resource, nil)
 		time.Sleep(100 * time.Millisecond)
 		return new(Slow)
-	})
+	}, schemabuilder.Expensive)
 
 	slow := schema.Object("Slow", Slow{})
 	slow.FieldFunc("count", func() bool {
@@ -262,7 +263,7 @@ func TestEndToEndAwaitAndCache(t *testing.T) {
             }
         }`, nil)
 
-	if err := graphql.PrepareQuery(builtSchema.Query, q.SelectionSet); err != nil {
+	if err := graphql.PrepareQuery(context.Background(), builtSchema.Query, q.SelectionSet); err != nil {
 		t.Error(err)
 	}
 
@@ -270,7 +271,7 @@ func TestEndToEndAwaitAndCache(t *testing.T) {
 
 	start := time.Now()
 	rerunner := reactive.NewRerunner(context.Background(), func(ctx context.Context) (interface{}, error) {
-		e := graphql.Executor{}
+		e := testgraphql.NewExecutorWrapper(t)
 		result, err := e.Execute(ctx, builtSchema.Query, nil, q)
 		if err != nil {
 			t.Error(err)
@@ -278,7 +279,7 @@ func TestEndToEndAwaitAndCache(t *testing.T) {
 
 		results <- internal.AsJSON(result)
 		return nil, nil
-	}, 0)
+	}, 0, false)
 	defer rerunner.Stop()
 
 	result := <-results
@@ -321,11 +322,11 @@ func TestEndToEndAwaitAndCache(t *testing.T) {
 func verifyArgumentOption(t *testing.T, query graphql.Type, queryString string, variables map[string]interface{}, expectedResult string) {
 	q := graphql.MustParse(queryString, variables)
 
-	if err := graphql.PrepareQuery(query, q.SelectionSet); err != nil {
+	if err := graphql.PrepareQuery(context.Background(), query, q.SelectionSet); err != nil {
 		t.Error(err)
 	}
 
-	e := graphql.Executor{}
+	e := testgraphql.NewExecutorWrapper(t)
 	result, err := e.Execute(context.Background(), query, nil, q)
 	if err != nil {
 		t.Error(err)
@@ -423,7 +424,7 @@ func TestConcurrencyLimiterDeadlock(t *testing.T) {
             }
         }`, nil)
 
-	if err := graphql.PrepareQuery(builtSchema.Query, q.SelectionSet); err != nil {
+	if err := graphql.PrepareQuery(context.Background(), builtSchema.Query, q.SelectionSet); err != nil {
 		t.Error(err)
 	}
 
@@ -431,7 +432,7 @@ func TestConcurrencyLimiterDeadlock(t *testing.T) {
 	wg.Add(1)
 	rerunner := reactive.NewRerunner(context.Background(), func(ctx context.Context) (interface{}, error) {
 		defer wg.Done()
-		e := graphql.Executor{}
+		e := testgraphql.NewExecutorWrapper(t)
 		ctx = concurrencylimiter.With(ctx, 100)
 
 		_, err := e.Execute(ctx, builtSchema.Query, nil, q)
@@ -441,7 +442,7 @@ func TestConcurrencyLimiterDeadlock(t *testing.T) {
 
 		assert.Equal(t, 2*200, calls)
 		return nil, nil
-	}, 0)
+	}, 0, false)
 
 	wg.Wait()
 	defer rerunner.Stop()

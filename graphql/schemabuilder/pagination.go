@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"sync"
 
+	"github.com/samsarahq/thunder/batch"
 	"github.com/samsarahq/thunder/graphql"
 	"github.com/samsarahq/thunder/internal/filter"
 	"golang.org/x/sync/errgroup"
@@ -21,6 +23,7 @@ type Connection struct {
 }
 
 var typeOfString = reflect.TypeOf("")
+var typeofFilterMap = reflect.TypeOf(map[batch.Index]string{})
 
 // paginateManually applies the pagination arguments to the edges in memory and sets hasNextPage +
 // hasPrevPage. The behavior is expected to conform to the Relay Cursor spec:
@@ -102,6 +105,8 @@ type ConnectionArgs struct {
 	Args interface{}
 	// filterText: "text search"
 	FilterText *string
+	// FilterTextFields: ["filter name"]
+	FilterTextFields *[]string
 	// sortBy: "fieldName"
 	SortBy *string
 	// sortOrder: "asc" | "desc"
@@ -116,9 +121,10 @@ type PaginationArgs struct {
 	After  *string
 	Before *string
 
-	FilterText *string
-	SortBy     *string
-	SortOrder  *SortOrder
+	FilterText       *string
+	FilterTextFields *[]string
+	SortBy           *string
+	SortOrder        *SortOrder
 }
 
 func (p PaginationArgs) limit() int {
@@ -393,56 +399,173 @@ func (c *connectionContext) pagesFromEdges(edges []Edge, limit int) (pages []str
 	return pages
 }
 
-func (c *connectionContext) applyTextFilter(ctx context.Context, nodes []interface{}, args PaginationArgs) ([]interface{}, error) {
-	if args.FilterText == nil || *args.FilterText == "" {
-		return nodes, nil
-	}
+type SafeBatchNodesToKeep struct {
+	nodesToKeep []bool
+	mux         sync.Mutex
+}
 
-	nodesToKeep := make([]bool, len(nodes))
-
+func (c *connectionContext) applyBatchTextFilter(ctx context.Context, nodes []interface{}, matchStrings []string, batchedFields map[string]*graphql.Field, nodesToKeep []bool) error {
 	g, ctx := errgroup.WithContext(ctx)
-	for unscopedI, unscopedNode := range nodes {
-		i, node := unscopedI, unscopedNode
+	m := &sync.Mutex{}
+	for unscopeName, unscopedFilterField := range batchedFields {
+		name, filterField := unscopeName, unscopedFilterField
 		g.Go(func() error {
-			keep := false
-			for name, filterField := range c.FilterTextFields {
-				// Resolve the graphql.Field made for sorting.
-				text, err := filterField.Resolve(ctx, node, nil, nil)
-				if err != nil {
-					return err
-				}
-
-				// Only strings are allowed for FilterText fields.
+			texts, err := graphql.SafeExecuteBatchResolver(ctx, filterField, nodes, nil, nil)
+			if err != nil {
+				return err
+			}
+			for i, text := range texts {
 				textString, ok := text.(string)
 				if !ok {
 					return fmt.Errorf("filter %s returned %T, must be a string", name, text)
 				}
-
-				if filter.Match(textString, *args.FilterText) {
-					keep = true
-					break
+				if filter.MatchText(textString, matchStrings) {
+					m.Lock()
+					nodesToKeep[i] = true
+					m.Unlock()
 				}
 			}
-
-			nodesToKeep[i] = keep
-
 			return nil
 		})
 	}
 
 	if err := g.Wait(); err != nil {
-		return nil, err
+		return err
+	}
+	return nil
+}
+
+func (c *connectionContext) checkFilters(ctx context.Context, node interface{}, matchStrings []string, filterFields map[string]*graphql.Field) (bool, error) {
+	keep := false
+	for name, filterField := range filterFields {
+		// Resolve the graphql.Field made for sorting.
+		text, err := graphql.SafeExecuteResolver(ctx, filterField, node, nil, nil)
+		if err != nil {
+			return keep, err
+		}
+		// Only strings are allowed for FilterText fields.
+		textString, ok := text.(string)
+		if !ok {
+			return keep, fmt.Errorf("filter %s returned %T, must be a string", name, text)
+		}
+		if filter.MatchText(textString, matchStrings) {
+			keep = true
+			break
+		}
+	}
+	return keep, nil
+}
+
+// We found that parallelizing non-expensive fields was slower due to the overhead of
+// spawning goroutines, so we execute non-expensive fields serially. We're also concerned
+// about the memory overhead of spawning many goroutines
+func (c *connectionContext) applyTextFilterNotBatchedExpensive(ctx context.Context, nodes []interface{}, matchStrings []string, filterFields map[string]*graphql.Field, nodesToKeep []bool) error {
+	g, ctx := errgroup.WithContext(ctx)
+	for unscopedI, unscopedNode := range nodes {
+		i, node := unscopedI, unscopedNode
+		g.Go(func() error {
+			keep, err := c.checkFilters(ctx, node, matchStrings, filterFields)
+			nodesToKeep[i] = keep
+			return err
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *connectionContext) applyTextFilterNotBatched(ctx context.Context, nodes []interface{}, matchStrings []string, filterFields map[string]*graphql.Field, nodesToKeep []bool) error {
+	for unscopedI, unscopedNode := range nodes {
+		i, node := unscopedI, unscopedNode
+		keep, err := c.checkFilters(ctx, node, matchStrings, filterFields)
+		if err != nil {
+			return err
+		}
+		nodesToKeep[i] = keep
+	}
+	return nil
+}
+
+func (c *connectionContext) applyTextFilter(ctx context.Context, nodes []interface{}, args PaginationArgs) ([]interface{}, error) {
+	if args.FilterText == nil || *args.FilterText == "" {
+		return nodes, nil
 	}
 
-	var filteredNodes []interface{}
-
-	for i, keep := range nodesToKeep {
-		if keep {
-			filteredNodes = append(filteredNodes, nodes[i])
+	filterFields := make(map[string]bool)
+	if args.FilterTextFields != nil {
+		for _, name := range *args.FilterTextFields {
+			filterFields[name] = true
+		}
+	} else {
+		for name, _ := range c.FilterTextFields {
+			filterFields[name] = true
 		}
 	}
 
+	filterTextFieldsNotBatched := make(map[string]*graphql.Field)
+	filterTextFieldsNotBatchedExpensive := make(map[string]*graphql.Field)
+	filterTextFieldsBatched := make(map[string]*graphql.Field)
+	for name, filterField := range c.FilterTextFields {
+		if _, ok := filterFields[name]; !ok {
+			continue
+		}
+		if filterField.Batch && filterField.UseBatchFunc(ctx) {
+			filterTextFieldsBatched[name] = filterField
+		} else {
+			if filterField.Expensive {
+				filterTextFieldsNotBatchedExpensive[name] = filterField
+			} else {
+				filterTextFieldsNotBatched[name] = filterField
+			}
+		}
+	}
+
+	g, ctx := errgroup.WithContext(ctx)
+	matchStrings := filter.GetMatchStrings(*args.FilterText)
+	nodesToKeep := make([]bool, len(nodes))
+	expensiveNodesToKeep := make([]bool, len(nodes))
+	batchedNodesToKeep := make([]bool, len(nodes))
+
+	if len(filterTextFieldsNotBatched) > 0 {
+		g.Go(func() error {
+			return c.applyTextFilterNotBatched(ctx, nodes, matchStrings, filterTextFieldsNotBatched, nodesToKeep)
+		})
+	}
+	if len(filterTextFieldsNotBatchedExpensive) > 0 {
+		g.Go(func() error {
+			return c.applyTextFilterNotBatchedExpensive(ctx, nodes, matchStrings, filterTextFieldsNotBatchedExpensive, expensiveNodesToKeep)
+		})
+	}
+	if len(filterTextFieldsBatched) > 0 {
+		g.Go(func() error {
+			return c.applyBatchTextFilter(ctx, nodes, matchStrings, filterTextFieldsBatched, batchedNodesToKeep)
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	var filteredNodes []interface{}
+	for i := range nodesToKeep {
+		if nodesToKeep[i] || batchedNodesToKeep[i] || expensiveNodesToKeep[i] {
+			filteredNodes = append(filteredNodes, nodes[i])
+		}
+	}
 	return filteredNodes, nil
+}
+
+func getSortReference(ctx context.Context, sortField *graphql.Field, node interface{}, i int) (*sortReference, error) {
+	// Resolve the graphql.Field made for sorting.
+	sortValue, err := graphql.SafeExecuteResolver(ctx, sortField, node, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	// Hang onto index in order added in order to properly sort the nodes.
+	return &sortReference{
+		index: i,
+		value: reflect.ValueOf(sortValue),
+	}, nil
+
 }
 
 func (c *connectionContext) applySort(ctx context.Context, nodes []interface{}, args PaginationArgs) ([]interface{}, error) {
@@ -462,27 +585,40 @@ func (c *connectionContext) applySort(ctx context.Context, nodes []interface{}, 
 		return nil, fmt.Errorf("unknown sort field %s", *args.SortBy)
 	}
 
-	// sortValues is the slice we'll be sorting (with the sorted values) in order to figure out
-	// node order.
+	// sortValues is the slice we'll be sorting (with the sorted values) in order to figure out node order.
 	sortValues := make([]sortReference, len(nodes))
 	g, ctx := errgroup.WithContext(ctx)
-
-	for unscopedI, unscopedNode := range nodes {
-		i, node := unscopedI, unscopedNode
-		g.Go(func() error {
-			// Resolve the graphql.Field made for sorting.
-			sortValue, err := sortField.Resolve(ctx, node, nil, nil)
-			if err != nil {
-				return err
-			}
-			// Hang onto index in order added in order to properly sort the nodes.
+	if sortField.Batch && sortField.UseBatchFunc(ctx) {
+		sortValuesBatched, err := graphql.SafeExecuteBatchResolver(ctx, sortField, nodes, nil, nil)
+		if err != nil {
+			return nil, err
+		}
+		for i, sortValue := range sortValuesBatched {
 			sortValues[i] = sortReference{
 				index: i,
 				value: reflect.ValueOf(sortValue),
 			}
-
-			return nil
-		})
+		}
+	} else {
+		for unscopedI, unscopedNode := range nodes {
+			i, node := unscopedI, unscopedNode
+			if sortField.Expensive {
+				g.Go(func() error {
+					sortValue, err := getSortReference(ctx, sortField, node, i)
+					if err != nil {
+						return err
+					}
+					sortValues[i] = *sortValue
+					return nil
+				})
+			} else {
+				sortValue, err := getSortReference(ctx, sortField, node, i)
+				if err != nil {
+					return nil, err
+				}
+				sortValues[i] = *sortValue
+			}
+		}
 	}
 
 	if err := g.Wait(); err != nil {
@@ -669,12 +805,10 @@ var sorts = map[reflect.Kind]func([]sortReference, SortOrder){
 	},
 }
 
-func (c *connectionContext) consumeSorts(sb *schemaBuilder, m *method, typ reflect.Type) error {
-	c.SortFunctions = make(map[string]func([]sortReference, SortOrder))
-	c.SortFields = make(map[string]*graphql.Field)
-
-	for name, fn := range m.SortFuncs {
-		sortableTyp := getFuncReturnType(fn)
+func (c *connectionContext) checkSortFunctionTypes(name string, sortMethod *method) error {
+	if sortMethod.BatchArgs.FallbackFunc != nil {
+		// Check the return type of the fallback function.
+		sortableTyp := getFuncReturnType(sortMethod.BatchArgs.FallbackFunc)
 		if !supportedSort(sortableTyp) {
 			return fmt.Errorf(
 				"invalid sort field %s: unsupported return type %v, must be of kind int, uint, float or string",
@@ -683,12 +817,57 @@ func (c *connectionContext) consumeSorts(sb *schemaBuilder, m *method, typ refle
 			)
 		}
 		c.SortFunctions[name] = getSort(sortableTyp)
+	}
 
-		// Build a GraphQL field for the function.
-		field, err := sb.buildFunction(typ, &method{Fn: fn})
+	if sortMethod.Batch == false {
+		// Check the return type of the function.
+		sortableTyp := getFuncReturnType(sortMethod.Fn)
+		if !supportedSort(sortableTyp) {
+			return fmt.Errorf(
+				"invalid sort field %s: unsupported return type %v, must be of kind int, uint, float or string",
+				name,
+				sortableTyp,
+			)
+		}
+		c.SortFunctions[name] = getSort(sortableTyp)
+	} else {
+		// Check the return type of the batched function
+		sortableTyp := getFuncReturnType(sortMethod.Fn)
+		if sortableTyp.Kind() != reflect.Map || !supportedSort(sortableTyp.Elem()) {
+			return fmt.Errorf(
+				"invalid sort field %s: unsupported return type %v, must be of kind int, uint, float or string",
+				name,
+				sortableTyp,
+			)
+		}
+		c.SortFunctions[name] = getSort(sortableTyp.Elem())
+	}
+	return nil
+}
+
+func (c *connectionContext) consumeSorts(sb *schemaBuilder, m *method, typ reflect.Type) error {
+	c.SortFunctions = make(map[string]func([]sortReference, SortOrder))
+	c.SortFields = make(map[string]*graphql.Field)
+
+	for name, sortMethod := range m.SortMethods {
+		err := c.checkSortFunctionTypes(name, sortMethod)
 		if err != nil {
 			return err
 		}
+
+		// Build a GraphQL field for the function.
+		var field *graphql.Field
+		if sortMethod.Batch && sortMethod.BatchArgs.FallbackFunc != nil && sortMethod.BatchArgs.ShouldUseFallbackFunc != nil {
+			field, err = sb.buildBatchFunctionWithFallback(typ, sortMethod)
+		} else if sortMethod.Batch {
+			field, err = sb.buildBatchFunction(typ, sortMethod)
+		} else {
+			field, err = sb.buildFunction(typ, sortMethod)
+		}
+		if err != nil {
+			return err
+		}
+
 		if field.Args != nil && len(field.Args) > 0 {
 			return fmt.Errorf("invalid sort field %s: sort fields can't take arguments", name)
 		}
@@ -698,18 +877,49 @@ func (c *connectionContext) consumeSorts(sb *schemaBuilder, m *method, typ refle
 	return nil
 }
 
+func (c *connectionContext) checkFilterTextFunctionTypes(name string, filterMethod *method) error {
+	if filterMethod.BatchArgs.FallbackFunc != nil {
+		batchFuncTyp := getFuncReturnType(filterMethod.BatchArgs.FallbackFunc)
+		if batchFuncTyp != typeOfString {
+			return fmt.Errorf("invalid text filter field %s: unsupported return type %v, must be a map[batch.Index]string", name, batchFuncTyp)
+		}
+	}
+
+	if filterMethod.Batch == false {
+		batchFuncTyp := getFuncReturnType(filterMethod.Fn)
+		if batchFuncTyp != typeOfString {
+			return fmt.Errorf("invalid text filter field %s: unsupported return type %v, must be a map[batch.Index]string", name, batchFuncTyp)
+		}
+	}
+
+	if filterMethod.Batch == true {
+		batchFuncTyp := getFuncReturnType(filterMethod.Fn)
+		if batchFuncTyp != typeofFilterMap {
+			return fmt.Errorf("invalid text filter field %s: unsupported return type %v, must be a map[batch.Index]string", name, batchFuncTyp)
+		}
+	}
+	return nil
+}
+
 func (c *connectionContext) consumeTextFilters(sb *schemaBuilder, m *method, typ reflect.Type) error {
 	c.FilterTextFields = make(map[string]*graphql.Field)
 
-	for name, fn := range m.TextFilterFuncs {
-		funcTyp := getFuncReturnType(fn)
+	for name, filterMethod := range m.TextFilterMethods {
 
-		if funcTyp != typeOfString {
-			return fmt.Errorf("invalid text filter field %s: unsupported return type %v, must be a string", name, funcTyp)
+		err := c.checkFilterTextFunctionTypes(name, filterMethod)
+		if err != nil {
+			return err
 		}
 
-		// Build a GraphQL field for the function.
-		field, err := sb.buildFunction(typ, &method{Fn: fn})
+		var field *graphql.Field
+		if filterMethod.Batch && filterMethod.BatchArgs.FallbackFunc != nil && filterMethod.BatchArgs.ShouldUseFallbackFunc != nil {
+			field, err = sb.buildBatchFunctionWithFallback(typ, filterMethod)
+		} else if filterMethod.Batch {
+			field, err = sb.buildBatchFunction(typ, filterMethod)
+		} else {
+			field, err = sb.buildFunction(typ, filterMethod)
+		}
+
 		if err != nil {
 			return err
 		}
@@ -718,7 +928,6 @@ func (c *connectionContext) consumeTextFilters(sb *schemaBuilder, m *method, typ
 		}
 		c.FilterTextFields[name] = field
 	}
-
 	return nil
 }
 
@@ -750,7 +959,6 @@ func (c *connectionContext) consumePaginatedArgs(sb *schemaBuilder, in []reflect
 		}
 
 	}
-
 	return argParser, argType, in, nil
 }
 
@@ -813,14 +1021,80 @@ func (c *connectionContext) parsePaginatedReturnSignature(m *method) (err error)
 
 }
 
+// buildPaginatedFieldWithFallback corresponds to buildFunction on a manually paginated type and a fallback paginated type
+func (sb *schemaBuilder) buildPaginatedFieldWithFallback(typ reflect.Type, m *method) (*graphql.Field, error) {
+	fallbackField, fallbackFuncCtx, err := sb.buildPaginatedFunctionAndFuncCtx(typ, &method{
+		Fn: m.ManualPaginationArgs.FallbackFunc,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	manualPaginationField, manualPaginationFuncCtx, err := sb.buildPaginatedFunctionAndFuncCtx(typ, m)
+	if err != nil {
+		return nil, err
+	}
+
+	// Validate that function signatures the manually paginated version and fallback version
+	if fallbackFuncCtx.hasContext != manualPaginationFuncCtx.hasContext ||
+		fallbackFuncCtx.hasArgs != manualPaginationFuncCtx.hasArgs ||
+		fallbackFuncCtx.hasSelectionSet != manualPaginationFuncCtx.hasSelectionSet ||
+		fallbackFuncCtx.hasError != manualPaginationFuncCtx.hasError ||
+		fallbackFuncCtx.hasRet != manualPaginationFuncCtx.hasRet {
+		return nil, fmt.Errorf("manual pagination and fallback function signatures did not match")
+	}
+
+	if fallbackField.Type.String() != manualPaginationField.Type.String() {
+		return nil, fmt.Errorf("manual pagination and fallback graphql return types did not match: ManualPagination(%v) Fallback(%v)", manualPaginationField.Type, fallbackField.Type)
+	}
+
+	if len(fallbackField.Args) != len(manualPaginationField.Args) {
+		return nil, fmt.Errorf("manual pagination and fallback arg type did not match: ManualPagination(%v) Fallback(%v)", manualPaginationField.Args, fallbackField.Args)
+	}
+
+	for key, fallbackTyp := range fallbackField.Args {
+		if manualPaginationType, ok := manualPaginationField.Args[key]; !ok || fallbackTyp.String() != manualPaginationType.String() {
+			return nil, fmt.Errorf("manual pagination and fallback func arg types did not match: ManualPagination(%v) Fallback(%v)", manualPaginationType, fallbackTyp)
+		}
+	}
+
+	dualParser := &dualArgParser{
+		argParser:         manualPaginationField.ParseArguments,
+		fallbackArgParser: fallbackField.ParseArguments,
+	}
+	field := &graphql.Field{
+		Resolve: func(ctx context.Context, source, args interface{}, selectionSet *graphql.SelectionSet) (i interface{}, e error) {
+			dualArgs := args.(dualArgResponses)
+			if m.ManualPaginationArgs.ShouldUseFallbackFunc(ctx) {
+				return fallbackField.Resolve(ctx, source, dualArgs.fallbackArgValue, selectionSet)
+			}
+			return manualPaginationField.Resolve(ctx, source, dualArgs.argValue, selectionSet)
+		},
+		Type:           manualPaginationField.Type,
+		Args:           manualPaginationField.Args,
+		ParseArguments: dualParser.Parse,
+		UseBatchFunc:   manualPaginationField.UseBatchFunc,
+		Batch:          manualPaginationField.Batch,
+		External:       manualPaginationField.External,
+		Expensive:      manualPaginationField.Expensive,
+	}
+
+	return field, nil
+
+}
+
 // buildPaginatedField corresponds to buildFunction on a paginated type. It wraps the return result
 // of f in a connection type.
 func (sb *schemaBuilder) buildPaginatedField(typ reflect.Type, m *method) (*graphql.Field, error) {
-	c := &connectionContext{funcContext: &funcContext{typ: typ}}
+	paginatedField, _, err := sb.buildPaginatedFunctionAndFuncCtx(typ, m)
+	return paginatedField, err
+}
 
+func (sb *schemaBuilder) buildPaginatedFunctionAndFuncCtx(typ reflect.Type, m *method) (*graphql.Field, *connectionContext, error) {
+	c := &connectionContext{funcContext: &funcContext{typ: typ}}
 	fun, err := c.getFuncVal(m)
 	if err != nil {
-		return nil, err
+		return nil, c, err
 	}
 
 	in := c.getFuncInputTypes()
@@ -828,7 +1102,7 @@ func (sb *schemaBuilder) buildPaginatedField(typ reflect.Type, m *method) (*grap
 
 	argParser, argType, in, err := c.consumePaginatedArgs(sb, in)
 	if err != nil {
-		return nil, err
+		return nil, c, err
 	}
 	c.hasArgs = true
 
@@ -836,27 +1110,27 @@ func (sb *schemaBuilder) buildPaginatedField(typ reflect.Type, m *method) (*grap
 
 	// We have succeeded if no arguments remain.
 	if len(in) != 0 {
-		return nil, fmt.Errorf("%s arguments should be [context][, [*]%s][, args][, selectionSet]", c.funcType, typ)
+		return nil, nil, fmt.Errorf("%s arguments should be [context][, [*]%s][, args][, selectionSet]", c.funcType, typ)
 	}
 
 	// Parse return values. The first return value must be the actual value, and
 	// the second value can optionally be an error.
 	if err := c.parsePaginatedReturnSignature(&method{MarkedNonNullable: true}); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := c.Validate(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// It's safe to assume that there's a return type since the method is marked as non-nullable
 	// when calling parseReturnSignature above.
 	if c.funcType.Out(0).Kind() != reflect.Slice {
-		return nil, fmt.Errorf("paginated field func must return a slice type")
+		return nil, nil, fmt.Errorf("paginated field func must return a slice type")
 	}
 	nodeType := c.funcType.Out(0).Elem()
 	retType, err := c.constructConnectionType(sb, nodeType)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// If the node type is a pointer, get a non-pointer reference for building text filter and
@@ -867,49 +1141,48 @@ func (sb *schemaBuilder) buildPaginatedField(typ reflect.Type, m *method) (*grap
 	}
 
 	if err := c.consumeTextFilters(sb, m, nonPtrNodeType); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	if err := c.consumeSorts(sb, m, nonPtrNodeType); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	c.Key, err = sb.getKeyFieldOnStruct(nodeType)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	args, err := c.argsTypeMap(argType)
 
 	ret := &graphql.Field{
 		Resolve: func(ctx context.Context, source, args interface{}, selectionSet *graphql.SelectionSet) (interface{}, error) {
+
 			argsVal := args
+			hasArgs := true
 			if !c.IsExternallyManaged() {
 				val, ok := args.(ConnectionArgs)
 				if !ok {
 					return nil, fmt.Errorf("arguments should implement ConnectionArgs")
 				}
-				c.hasArgs = val.Args != nil
-				if c.hasArgs {
+				hasArgs = val.Args != nil
+				if hasArgs {
 					argsVal = reflect.ValueOf(val.Args).Elem().Interface()
 				}
 			}
-
-			in := c.prepareResolveArgs(source, argsVal, ctx)
-
-			// Call the function.
-			out := fun.Call(in)
-
+			in := c.prepareResolveArgs(source, hasArgs, argsVal, ctx, selectionSet)
+			var out []reflect.Value
+			out = fun.Call(in)
 			return c.extractReturnAndErr(ctx, out, args, retType)
 
 		},
 		Args:           args,
 		Type:           retType,
 		ParseArguments: argParser.Parse,
-		Expensive:      c.hasContext,
+		Expensive:      m.Expensive,
+		External:       true,
 	}
-
-	return ret, nil
+	return ret, c, nil
 }
 
 func (c *connectionContext) extractReturnAndErr(ctx context.Context, out []reflect.Value, args interface{}, retType graphql.Type) (interface{}, error) {
@@ -919,14 +1192,16 @@ func (c *connectionContext) extractReturnAndErr(ctx context.Context, out []refle
 	// struct and setup for the slicing functions.
 	if !c.IsExternallyManaged() {
 		connectionArgs, _ := args.(ConnectionArgs)
+
 		paginationArgs = PaginationArgs{
-			First:      connectionArgs.First,
-			Last:       connectionArgs.Last,
-			After:      connectionArgs.After,
-			Before:     connectionArgs.Before,
-			FilterText: connectionArgs.FilterText,
-			SortBy:     connectionArgs.SortBy,
-			SortOrder:  connectionArgs.SortOrder,
+			First:            connectionArgs.First,
+			Last:             connectionArgs.Last,
+			After:            connectionArgs.After,
+			Before:           connectionArgs.Before,
+			FilterText:       connectionArgs.FilterText,
+			FilterTextFields: connectionArgs.FilterTextFields,
+			SortBy:           connectionArgs.SortBy,
+			SortOrder:        connectionArgs.SortOrder,
 		}
 	} else {
 		paginationArgs = reflect.ValueOf(args).Field(c.PaginationArgsIndex).Interface().(PaginationArgs)

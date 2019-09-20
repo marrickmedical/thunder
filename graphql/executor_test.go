@@ -1,4 +1,4 @@
-package graphql
+package graphql_test
 
 import (
 	"context"
@@ -8,100 +8,107 @@ import (
 	"testing"
 
 	"github.com/davecgh/go-spew/spew"
+	"github.com/samsarahq/thunder/graphql"
+	"github.com/samsarahq/thunder/graphql/schemabuilder"
 	"github.com/samsarahq/thunder/internal"
+	"github.com/samsarahq/thunder/internal/testgraphql"
+	"github.com/stretchr/testify/require"
 )
 
-func makeQuery(onArgParse *func()) *Object {
+func makeQuery(onArgParse *func()) *graphql.Object {
 	noArguments := func(json interface{}) (interface{}, error) {
 		return nil, nil
 	}
 
-	query := &Object{
+	query := &graphql.Object{
 		Name:   "Query",
-		Fields: make(map[string]*Field),
+		Fields: make(map[string]*graphql.Field),
 	}
 
-	a := &Object{
+	a := &graphql.Object{
 		Name: "A",
-		Key: func(ctx context.Context, source, args interface{}, selectionSet *SelectionSet) (interface{}, error) {
-			return source, nil
+		KeyField: &graphql.Field{
+			Resolve: func(ctx context.Context, source, args interface{}, selectionSet *graphql.SelectionSet) (interface{}, error) {
+				return source, nil
+			},
+			Type: &graphql.Scalar{Type: "string"},
 		},
-		Fields: make(map[string]*Field),
+		Fields: make(map[string]*graphql.Field),
 	}
 
-	query.Fields["a"] = &Field{
-		Resolve: func(ctx context.Context, source, args interface{}, selectionSet *SelectionSet) (interface{}, error) {
+	query.Fields["a"] = &graphql.Field{
+		Resolve: func(ctx context.Context, source, args interface{}, selectionSet *graphql.SelectionSet) (interface{}, error) {
 			return 0, nil
 		},
 		Type:           a,
 		ParseArguments: noArguments,
 	}
 
-	query.Fields["as"] = &Field{
-		Resolve: func(ctx context.Context, source, args interface{}, selectionSet *SelectionSet) (interface{}, error) {
+	query.Fields["as"] = &graphql.Field{
+		Resolve: func(ctx context.Context, source, args interface{}, selectionSet *graphql.SelectionSet) (interface{}, error) {
 			return []int{0, 1, 2, 3}, nil
 		},
-		Type:           &List{Type: a},
+		Type:           &graphql.List{Type: a},
 		ParseArguments: noArguments,
 	}
 
-	query.Fields["static"] = &Field{
-		Resolve: func(ctx context.Context, source, args interface{}, selectionSet *SelectionSet) (interface{}, error) {
+	query.Fields["static"] = &graphql.Field{
+		Resolve: func(ctx context.Context, source, args interface{}, selectionSet *graphql.SelectionSet) (interface{}, error) {
 			return "static", nil
 		},
-		Type:           &Scalar{Type: "string"},
+		Type:           &graphql.Scalar{Type: "string"},
 		ParseArguments: noArguments,
 	}
 
-	query.Fields["error"] = &Field{
-		Resolve: func(ctx context.Context, source, args interface{}, selectionSet *SelectionSet) (interface{}, error) {
+	query.Fields["error"] = &graphql.Field{
+		Resolve: func(ctx context.Context, source, args interface{}, selectionSet *graphql.SelectionSet) (interface{}, error) {
 			return nil, errors.New("test error")
 		},
-		Type:           &Scalar{Type: "string"},
+		Type:           &graphql.Scalar{Type: "string"},
 		ParseArguments: noArguments,
 	}
 
-	query.Fields["panic"] = &Field{
-		Resolve: func(ctx context.Context, source, args interface{}, selectionSet *SelectionSet) (interface{}, error) {
+	query.Fields["panic"] = &graphql.Field{
+		Resolve: func(ctx context.Context, source, args interface{}, selectionSet *graphql.SelectionSet) (interface{}, error) {
 			panic("test panic")
 		},
-		Type:           &Scalar{Type: "string"},
+		Type:           &graphql.Scalar{Type: "string"},
 		ParseArguments: noArguments,
 	}
 
-	a.Fields["value"] = &Field{
-		Resolve: func(ctx context.Context, source, args interface{}, selectionSet *SelectionSet) (interface{}, error) {
+	a.Fields["value"] = &graphql.Field{
+		Resolve: func(ctx context.Context, source, args interface{}, selectionSet *graphql.SelectionSet) (interface{}, error) {
 			return source.(int), nil
 		},
-		Type:           &Scalar{Type: "int"},
+		Type:           &graphql.Scalar{Type: "int"},
 		ParseArguments: noArguments,
 	}
 
-	a.Fields["valuePtr"] = &Field{
-		Resolve: func(ctx context.Context, source, args interface{}, selectionSet *SelectionSet) (interface{}, error) {
+	a.Fields["valuePtr"] = &graphql.Field{
+		Resolve: func(ctx context.Context, source, args interface{}, selectionSet *graphql.SelectionSet) (interface{}, error) {
 			temp := source.(int)
 			if temp%2 == 0 {
 				return nil, nil
 			}
 			return &temp, nil
 		},
-		Type:           &Scalar{Type: "int"},
+		Type:           &graphql.Scalar{Type: "int"},
 		ParseArguments: noArguments,
 	}
 
-	a.Fields["nested"] = &Field{
-		Resolve: func(ctx context.Context, source, args interface{}, selectionSet *SelectionSet) (interface{}, error) {
+	a.Fields["nested"] = &graphql.Field{
+		Resolve: func(ctx context.Context, source, args interface{}, selectionSet *graphql.SelectionSet) (interface{}, error) {
 			return source.(int) + 1, nil
 		},
 		Type:           a,
 		ParseArguments: noArguments,
 	}
 
-	a.Fields["fieldWithArgs"] = &Field{
-		Resolve: func(ctx context.Context, source, args interface{}, selectionSet *SelectionSet) (interface{}, error) {
+	a.Fields["fieldWithArgs"] = &graphql.Field{
+		Resolve: func(ctx context.Context, source, args interface{}, selectionSet *graphql.SelectionSet) (interface{}, error) {
 			return 1, nil
 		},
-		Type: &Scalar{Type: "int"},
+		Type: &graphql.Scalar{Type: "int"},
 		ParseArguments: func(json interface{}) (interface{}, error) {
 			if onArgParse != nil {
 				(*onArgParse)()
@@ -116,47 +123,47 @@ func makeQuery(onArgParse *func()) *Object {
 func TestBasic(t *testing.T) {
 	query := makeQuery(nil)
 
-	q := MustParse(`{
+	q := graphql.MustParse(`{
 		static
 		a { value nested { value } }
 		as { value valuePtr }
 	}`, nil)
 
-	if err := PrepareQuery(query, q.SelectionSet); err != nil {
+	if err := graphql.PrepareQuery(context.Background(), query, q.SelectionSet); err != nil {
 		t.Error(err)
 	}
-	e := Executor{}
+	e := testgraphql.NewExecutorWrapper(t)
 	result, err := e.Execute(context.Background(), query, nil, q)
 	if err != nil {
 		t.Error(err)
 	}
 
 	// assert that result["as"][1]["valuePtr"] == 1 (and not a pointer to 1)
-	root, _ := result.(map[string]interface{})
+	root, _ := internal.AsJSON(result).(map[string]interface{})
 	as, _ := root["as"].([]interface{})
 	asObject, _ := as[1].(map[string]interface{})
-	if asObject["valuePtr"] != 1 {
+	if int(asObject["valuePtr"].(float64)) != 1 {
 		t.Error("Expected valuePtr to be 1, was", asObject["valuePtr"])
 	}
 
 	if !reflect.DeepEqual(internal.AsJSON(result), internal.ParseJSON(`
-		{
-			"static": "static",
-			"a": {
-				"value": 0,
-				"__key": 0,
-				"nested": {
-					"value": 1,
-					"__key": 1
-				}
-			},
-			"as": [
-			        {"value": 0, "valuePtr": null, "__key": 0},
-				{"value": 1, "valuePtr": 1, "__key": 1},
-				{"value": 2, "valuePtr": null, "__key": 2},
-				{"value": 3, "valuePtr": 3, "__key": 3}
-			]
-		}`)) {
+{
+	"static": "static",
+	"a": {
+		"value": 0,
+		"__key": 0,
+		"nested": {
+			"value": 1,
+			"__key": 1
+		}
+	},
+	"as": [
+		{"value": 0, "valuePtr": null, "__key": 0},
+		{"value": 1, "valuePtr": 1, "__key": 1},
+		{"value": 2, "valuePtr": null, "__key": 2},
+		{"value": 3, "valuePtr": 3, "__key": 3}
+	]
+}`)) {
 		t.Error("bad value", spew.Sdump(internal.AsJSON(result)))
 	}
 }
@@ -168,7 +175,7 @@ func TestRepeatedFragment(t *testing.T) {
 	}
 	query := makeQuery(&countArgParse)
 
-	q := MustParse(`{
+	q := graphql.MustParse(`{
 		static
 		a { value nested { value ...frag } ...frag }
 		as { value }
@@ -178,10 +185,10 @@ func TestRepeatedFragment(t *testing.T) {
 	}
 	`, nil)
 
-	if err := PrepareQuery(query, q.SelectionSet); err != nil {
+	if err := graphql.PrepareQuery(context.Background(), query, q.SelectionSet); err != nil {
 		t.Error(err)
 	}
-	e := Executor{}
+	e := testgraphql.NewExecutorWrapper(t)
 	_, err := e.Execute(context.Background(), query, nil, q)
 	if err != nil {
 		t.Error(err)
@@ -245,17 +252,17 @@ func TestBadArgs(t *testing.T) {
 func TestError(t *testing.T) {
 	query := makeQuery(nil)
 
-	q := MustParse(`
+	q := graphql.MustParse(`
 		query foo {
 			error
 		}
 	`, map[string]interface{}{})
 
-	if err := PrepareQuery(query, q.SelectionSet); err != nil {
+	if err := graphql.PrepareQuery(context.Background(), query, q.SelectionSet); err != nil {
 		t.Error(err)
 	}
 
-	e := Executor{}
+	e := testgraphql.NewExecutorWrapper(t)
 	_, err := e.Execute(context.Background(), query, nil, q)
 	if err == nil || err.Error() != "foo.error: test error" {
 		t.Error("expected test error")
@@ -267,18 +274,17 @@ func TestError(t *testing.T) {
 func TestPanic(t *testing.T) {
 	query := makeQuery(nil)
 
-	q := MustParse(`
+	q := graphql.MustParse(`
 		{
 			panic
 		}
 	`, nil)
 
-	if err := PrepareQuery(query, q.SelectionSet); err != nil {
+	if err := graphql.PrepareQuery(context.Background(), query, q.SelectionSet); err != nil {
 		t.Error(err)
 	}
 
-	e := Executor{}
-
+	e := testgraphql.NewExecutorWrapperWithoutExactErrorMatch(t)
 	_, err := e.Execute(context.Background(), query, nil, q)
 	if err == nil || !strings.Contains(err.Error(), "test panic") {
 		t.Error("expected test panic")
@@ -289,3 +295,83 @@ func TestPanic(t *testing.T) {
 }
 
 // TODO: Verify caching and concurrency
+
+func TestExecutorRuns(t *testing.T) {
+	type Object struct {
+		Key string
+	}
+	tests := []struct {
+		name           string
+		objectFunc     interface{}
+		resolverFunc   interface{}
+		query          string
+		wantResultJSON string
+		wantError      string
+	}{
+		{
+			name: "fail on 3rd value",
+			objectFunc: func(ctx context.Context) []*Object {
+				return []*Object{
+					&Object{Key: "key1"},
+					&Object{Key: "key2"},
+					&Object{Key: "key3"},
+				}
+			},
+			resolverFunc: func(ctx context.Context, o Object) (string, error) {
+				if o.Key == "key3" {
+					return "", errors.New("failing on third key")
+				}
+				return o.Key, nil
+			},
+			query: `
+			{
+				objects {
+					key
+					value
+				}
+			}`,
+			wantError: "objects.2.value: failing on third key",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			builder := schemabuilder.NewSchema()
+			builder.Query().FieldFunc("objects", tt.objectFunc)
+
+			obj := builder.Object("object", Object{})
+			obj.FieldFunc("value", tt.resolverFunc)
+			schema, err := builder.Build()
+			require.NoError(t, err)
+
+			q := graphql.MustParse(tt.query, nil)
+
+			if err := graphql.PrepareQuery(context.Background(), schema.Query, q.SelectionSet); err != nil {
+				t.Error(err)
+			}
+
+			e := testgraphql.NewExecutorWrapper(t)
+
+			ctx := context.Background()
+			res, err := e.Execute(ctx, schema.Query, nil, q)
+			if tt.wantError != "" {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tt.wantError)
+				return
+			}
+			require.NoError(t, err)
+
+			wantParsedJSON := internal.ParseJSON(tt.wantResultJSON)
+			gotJSON := internal.AsJSON(res)
+
+			require.Equal(
+				t,
+				wantParsedJSON,
+				gotJSON,
+				"Mismatch for expected vs actual response.  Want:\n%s\nGot:\n%s",
+				internal.MarshalJSON(wantParsedJSON),
+				internal.MarshalJSON(gotJSON),
+			)
+		})
+	}
+}

@@ -10,6 +10,7 @@ import (
 	"github.com/samsarahq/thunder/graphql"
 	"github.com/samsarahq/thunder/graphql/schemabuilder"
 	"github.com/samsarahq/thunder/internal"
+	"github.com/samsarahq/thunder/internal/testgraphql"
 )
 
 type GatewayType int
@@ -62,15 +63,15 @@ func TestUnionType(t *testing.T) {
 	q := graphql.MustParse(`
 		{
 			asset: gateway(type: "asset") { __typename ... on Asset { name batteryLevel } ... on Vehicle { name speed } }
-			vehicle: gateway(type: "vehicle") { ... on Asset { name batteryLevel } ... on Vehicle { name speed } }
+			vehicle: gateway(type: "vehicle") { __typename ... on Asset { name batteryLevel } ... on Vehicle { name speed } }
 		}
 	`, map[string]interface{}{"var": float64(3)})
 
-	if err := graphql.PrepareQuery(builtSchema.Query, q.SelectionSet); err != nil {
+	if err := graphql.PrepareQuery(ctx, builtSchema.Query, q.SelectionSet); err != nil {
 		t.Error(err)
 	}
 
-	e := graphql.Executor{}
+	e := testgraphql.NewExecutorWrapper(t)
 
 	result, err := e.Execute(ctx, builtSchema.Query, nil, q)
 	if err != nil {
@@ -78,7 +79,7 @@ func TestUnionType(t *testing.T) {
 	}
 
 	if d := pretty.Compare(internal.AsJSON(result), internal.ParseJSON(`
-		{"vehicle": { "name": "a", "speed": 50 }, "asset": { "name": "b", "batteryLevel": 5, "__typename": "Gateway" }}`)); d != "" {
+		{"vehicle": { "name": "a", "speed": 50, "__typename": "Vehicle" }, "asset": { "name": "b", "batteryLevel": 5, "__typename": "Asset" }}`)); d != "" {
 		t.Errorf("expected did not match result: %s", d)
 	}
 }
@@ -200,18 +201,22 @@ func TestBadUnionNonOneHot(t *testing.T) {
 
 	q := graphql.MustParse(`{ union { __typename } }`, map[string]interface{}{"var": float64(3)})
 
-	if err := graphql.PrepareQuery(builtSchema.Query, q.SelectionSet); err != nil {
+	if err := graphql.PrepareQuery(ctx, builtSchema.Query, q.SelectionSet); err != nil {
 		t.Error(err)
 	}
 
-	e := graphql.Executor{}
-	_, err := e.Execute(ctx, builtSchema.Query, nil, q)
-	if err == nil {
-		t.Error("expected err, received nil")
-	}
+	for _, execWithName := range testgraphql.GetExecutors() {
+		t.Run(execWithName.Name, func(t *testing.T) {
+			e := execWithName.Executor
+			_, err := e.Execute(ctx, builtSchema.Query, nil, q)
+			if err == nil {
+				t.Error("expected err, received nil")
+			}
 
-	if !strings.Contains(err.Error(), "union type field should only return one value") {
-		t.Errorf("expected err, received %s", err.Error())
+			if !strings.Contains(err.Error(), "union type field should only return one value") {
+				t.Errorf("expected err, received %s", err.Error())
+			}
+		})
 	}
 }
 
@@ -237,11 +242,11 @@ func TestUnionList(t *testing.T) {
 
 	q := graphql.MustParse(`{ list { ... on UnionPart1 { otherThing } ... on UnionPart2 { thing } } }`, map[string]interface{}{"var": float64(3)})
 
-	if err := graphql.PrepareQuery(builtSchema.Query, q.SelectionSet); err != nil {
+	if err := graphql.PrepareQuery(ctx, builtSchema.Query, q.SelectionSet); err != nil {
 		t.Error(err)
 	}
 
-	e := graphql.Executor{}
+	e := testgraphql.NewExecutorWrapper(t)
 	result, err := e.Execute(ctx, builtSchema.Query, nil, q)
 	if err != nil {
 		t.Errorf("expected no error, received %s", err.Error())
@@ -280,11 +285,11 @@ func TestUnionStruct(t *testing.T) {
 
 	q := graphql.MustParse(`{ wrapper { x {... on UnionPart1 { otherThing } ... on UnionPart2 { thing } } } }`, map[string]interface{}{"var": float64(3)})
 
-	if err := graphql.PrepareQuery(builtSchema.Query, q.SelectionSet); err != nil {
+	if err := graphql.PrepareQuery(ctx, builtSchema.Query, q.SelectionSet); err != nil {
 		t.Error(err)
 	}
 
-	e := graphql.Executor{}
+	e := testgraphql.NewExecutorWrapper(t)
 	result, err := e.Execute(ctx, builtSchema.Query, nil, q)
 	if err != nil {
 		t.Errorf("expected no error, received %s", err.Error())

@@ -1,6 +1,9 @@
 package schemabuilder
 
-import "reflect"
+import (
+	"context"
+	"reflect"
+)
 
 // A Object represents a Go type and set of methods to be converted into an
 // Object in a GraphQL schema.
@@ -41,16 +44,124 @@ var Paginated fieldFuncOptionFunc = func(m *method) {
 	m.Paginated = true
 }
 
-type TextFilterFields map[string]interface{}
-
-func (s TextFilterFields) apply(m *method) {
-	m.TextFilterFuncs = s
+// Expensive is an option that can be passed to a FieldFunc to indicate that
+// the function is expensive to execute, so it should be parallelized.
+var Expensive fieldFuncOptionFunc = func(m *method) {
+	m.Expensive = true
 }
 
-type SortFields map[string]interface{}
+func FilterField(name string, filter interface{}, options ...FieldFuncOption) FieldFuncOption {
+	textFilterMethod := &method{Fn: filter, Batch: false, MarkedNonNullable: true}
+	for _, opt := range options {
+		opt.apply(textFilterMethod)
+	}
+	var fieldFuncTextFilterFields fieldFuncOptionFunc = func(m *method) {
+		if m.TextFilterMethods == nil {
+			m.TextFilterMethods = map[string]*method{}
+		}
+		if _, ok := m.TextFilterMethods[name]; ok {
+			panic("Field Filters have the same name: " + name)
+		}
+		m.TextFilterMethods[name] = textFilterMethod
+	}
+	return fieldFuncTextFilterFields
+}
 
-func (s SortFields) apply(m *method) {
-	m.SortFuncs = s
+func BatchFilterField(name string, batchFilter interface{}, options ...FieldFuncOption) FieldFuncOption {
+	textFilterMethod := &method{Fn: batchFilter, Batch: true, MarkedNonNullable: true}
+	for _, opt := range options {
+		opt.apply(textFilterMethod)
+	}
+	var fieldFuncTextFilterFields fieldFuncOptionFunc = func(m *method) {
+		if m.TextFilterMethods == nil {
+			m.TextFilterMethods = map[string]*method{}
+		}
+		if _, ok := m.TextFilterMethods[name]; ok {
+			panic("Field Filters have the same name: " + name)
+		}
+		m.TextFilterMethods[name] = textFilterMethod
+	}
+	return fieldFuncTextFilterFields
+}
+
+func BatchFilterFieldWithFallback(name string, batchFilter interface{}, filter interface{}, flag func(context.Context) bool, options ...FieldFuncOption) FieldFuncOption {
+	textFilterMethod := &method{
+		Fn: batchFilter,
+		BatchArgs: batchArgs{
+			FallbackFunc:          filter,
+			ShouldUseFallbackFunc: flag,
+		}, Batch: true,
+		MarkedNonNullable: true}
+	for _, opt := range options {
+		opt.apply(textFilterMethod)
+	}
+	var fieldFuncTextFilterFields fieldFuncOptionFunc = func(m *method) {
+		if m.TextFilterMethods == nil {
+			m.TextFilterMethods = map[string]*method{}
+		}
+		if _, ok := m.TextFilterMethods[name]; ok {
+			panic("Field Filters have the same name: " + name)
+		}
+		m.TextFilterMethods[name] = textFilterMethod
+	}
+	return fieldFuncTextFilterFields
+}
+
+func SortField(name string, sort interface{}, options ...FieldFuncOption) FieldFuncOption {
+	sortMethod := &method{Fn: sort, Batch: false, MarkedNonNullable: true}
+	for _, opt := range options {
+		opt.apply(sortMethod)
+	}
+	var fieldFuncSortFields fieldFuncOptionFunc = func(m *method) {
+		if m.SortMethods == nil {
+			m.SortMethods = map[string]*method{}
+		}
+		if _, ok := m.SortMethods[name]; ok {
+			panic("Sorts fields have the same name: " + name)
+		}
+		m.SortMethods[name] = sortMethod
+	}
+	return fieldFuncSortFields
+}
+
+func BatchSortField(name string, batchSort interface{}, options ...FieldFuncOption) FieldFuncOption {
+	sortMethod := &method{Fn: batchSort, Batch: true, MarkedNonNullable: true}
+	for _, opt := range options {
+		opt.apply(sortMethod)
+	}
+	var fieldFuncSortFields fieldFuncOptionFunc = func(m *method) {
+		if m.SortMethods == nil {
+			m.SortMethods = map[string]*method{}
+		}
+		if _, ok := m.SortMethods[name]; ok {
+			panic("Sorts fields have the same name: " + name)
+		}
+		m.SortMethods[name] = sortMethod
+	}
+	return fieldFuncSortFields
+}
+
+func BatchSortFieldWithFallback(name string, batchSort interface{}, sort interface{}, flag func(context.Context) bool, options ...FieldFuncOption) FieldFuncOption {
+	sortMethod := &method{
+		Fn: batchSort,
+		BatchArgs: batchArgs{
+			FallbackFunc:          sort,
+			ShouldUseFallbackFunc: flag,
+		}, Batch: true,
+		MarkedNonNullable: true}
+	for _, opt := range options {
+		opt.apply(sortMethod)
+	}
+	var fieldFuncSortFields fieldFuncOptionFunc = func(m *method) {
+		if m.SortMethods == nil {
+			m.SortMethods = map[string]*method{}
+		}
+		if _, ok := m.SortMethods[name]; ok {
+			panic("Sorts fields have the same name: " + name)
+		}
+		m.SortMethods[name] = sortMethod
+	}
+	return fieldFuncSortFields
 }
 
 // FieldFunc exposes a field on an object. The function f can take a number of
@@ -87,6 +198,71 @@ func (s *Object) FieldFunc(name string, f interface{}, options ...FieldFuncOptio
 	s.Methods[name] = m
 }
 
+func (s *Object) BatchFieldFunc(name string, batchFunc interface{}, options ...FieldFuncOption) {
+	if s.Methods == nil {
+		s.Methods = make(Methods)
+	}
+
+	m := &method{
+		Fn:    batchFunc,
+		Batch: true,
+	}
+	for _, opt := range options {
+		opt.apply(m)
+	}
+
+	if _, ok := s.Methods[name]; ok {
+		panic("duplicate method")
+	}
+	s.Methods[name] = m
+}
+
+func (s *Object) BatchFieldFuncWithFallback(name string, batchFunc interface{}, fallbackFunc interface{}, flag UseFallbackFlag, options ...FieldFuncOption) {
+	if s.Methods == nil {
+		s.Methods = make(Methods)
+	}
+
+	m := &method{
+		Fn: batchFunc,
+		BatchArgs: batchArgs{
+			FallbackFunc:          fallbackFunc,
+			ShouldUseFallbackFunc: flag,
+		},
+		Batch: true,
+	}
+	for _, opt := range options {
+		opt.apply(m)
+	}
+
+	if _, ok := s.Methods[name]; ok {
+		panic("duplicate method")
+	}
+	s.Methods[name] = m
+}
+
+func (s *Object) ManualPaginationWithFallback(name string, manualPaginatedFunc interface{}, fallbackFunc interface{}, flag UseFallbackFlag, options ...FieldFuncOption) {
+	if s.Methods == nil {
+		s.Methods = make(Methods)
+	}
+
+	m := &method{
+		Fn: manualPaginatedFunc,
+		ManualPaginationArgs: manualPaginationArgs{
+			FallbackFunc:          fallbackFunc,
+			ShouldUseFallbackFunc: flag,
+		},
+		Paginated: true,
+	}
+	for _, opt := range options {
+		opt.apply(m)
+	}
+
+	if _, ok := s.Methods[name]; ok {
+		panic("duplicate method")
+	}
+	s.Methods[name] = m
+}
+
 // Key registers the key field on an object. The field should be specified by the name of the
 // graphql field.
 // For example, for an object User:
@@ -105,10 +281,34 @@ type method struct {
 
 	// Whether or not the FieldFunc is paginated.
 	Paginated bool
+
+	// Whether or not the FieldFunc has been marked as expensive.
+	Expensive bool
+
 	// Text filter methods
-	TextFilterFuncs map[string]interface{}
+	TextFilterMethods map[string]*method
+
 	// Sort methods
-	SortFuncs map[string]interface{}
+	SortMethods map[string]*method
+
+	// Whether the FieldFunc is a batchField
+	Batch bool
+
+	BatchArgs batchArgs
+
+	ManualPaginationArgs manualPaginationArgs
+}
+
+type UseFallbackFlag func(context.Context) bool
+
+type batchArgs struct {
+	FallbackFunc          interface{}
+	ShouldUseFallbackFunc UseFallbackFlag
+}
+
+type manualPaginationArgs struct {
+	FallbackFunc          interface{}
+	ShouldUseFallbackFunc UseFallbackFlag
 }
 
 // A Methods map represents the set of methods exposed on a Object.

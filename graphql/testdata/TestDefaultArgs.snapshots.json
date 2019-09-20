@@ -1,6 +1,6 @@
 [
   {
-    "Name": "happy path all provided",
+    "Name": "batchExecutor:happy path all provided",
     "Values": [
       {
         "inner": {
@@ -19,7 +19,7 @@
     ]
   },
   {
-    "Name": "missing optional parameter does not error",
+    "Name": "batchExecutor:missing optional parameter does not error",
     "Values": [
       {
         "inner": {
